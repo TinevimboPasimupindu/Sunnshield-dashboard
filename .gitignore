@@ -1,0 +1,18 @@
+# Python
+server/venv/
+server/.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+client/node_modules/
+client/dist/
+
+# Database
+*.db
+*.sqlite
+
+# Misc
+.DS_Store
+.env
