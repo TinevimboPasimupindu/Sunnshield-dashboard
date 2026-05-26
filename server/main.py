@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import engine, Base
 from dotenv import load_dotenv
-from routes import auth
+from routes import auth, orders, batches
 import models
 
 load_dotenv()
@@ -20,6 +20,8 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(orders.router)
+app.include_router(batches.router)
 
 @app.get("/")
 def root():
