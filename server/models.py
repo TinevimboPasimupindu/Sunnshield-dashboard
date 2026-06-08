@@ -59,6 +59,8 @@ class Order(Base):
     currency = Column(Enum(CurrencyEnum), nullable=False, default=CurrencyEnum.USD)
     term_months = Column(Integer, nullable=False)
     monthly_instalment = Column(Float, nullable=False)
+    start_date = Column(String, nullable=True)
+    end_date = Column(String, nullable=True)
     scanned_form_path = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     client = relationship("Client", back_populates="orders")

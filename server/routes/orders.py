@@ -8,24 +8,31 @@ import anthropic
 import base64
 import os
 import json
+import pathlib
+from dotenv import load_dotenv
+
+# Load .env from the server directory
+load_dotenv(dotenv_path=pathlib.Path(__file__).parent / ".env")
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
 
 class OrderCreate(BaseModel):
-    full_name: str
-    id_number: str
     ec_number: str
+    id_number: str
     reference_number: Optional[str] = None
-    employer: Optional[str] = None
+    start_date: str
+    end_date: str
     amount: float
     currency: str = "USD"
-    term_months: int
     vehicle_id: Optional[int] = None
 
 @router.post("/scan")
 async def scan_form(file: UploadFile = File(...)):
+
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
     contents = await file.read()
     base64_image = base64.standard_b64encode(contents).decode("utf-8")
 
@@ -39,7 +46,7 @@ async def scan_form(file: UploadFile = File(...)):
     media_type = media_type_map.get(extension, "image/jpeg")
 
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5",
         max_tokens=1000,
         messages=[
             {
@@ -55,21 +62,17 @@ async def scan_form(file: UploadFile = File(...)):
                     },
                     {
                         "type": "text",
-                        "text": """Extract the following fields from this civil servant order form and return ONLY a valid JSON object with no extra text, no markdown, no backticks.
+                        "text": """You are reading a Zimbabwean civil servant salary deduction form. Extract exactly these fields:
 
-Fields to extract:
-- full_name (string)
-- id_number (string, SA ID number)
-- ec_number (string, employee/payroll number)
-- reference_number (string)
-- employer (string, department or institution)
-- amount (number, purchase amount)
-- term_months (number, repayment period in months)
-- currency (string, either USD or ZWL)
+- ec_number: labeled EC NUMBER (may include a letter e.g. 2012368F)
+- id_number: labeled I.D NUMBER (Zimbabwean format with a letter before last 2 digits e.g. 12139005V12)
+- reference_number: labeled REFERENCE NUMBER
+- start_date: labeled FROM DATE (format DD/MM/YYYY)
+- end_date: labeled TO DATE (format DD/MM/YYYY)
+- amount: labeled AMOUNT — the monthly instalment. It is written with a dash or full stop separating rands/dollars from cents. For example 8-75 means 8.75, 875 means 8.75, 12-50 means 12.50. The number before the dash is the main amount and the 2 digits after are cents. Return as a decimal number.
 
-If a field is not found or unclear, set it to null.
-
-Return only the JSON object."""
+Return ONLY a valid JSON object with these exact keys: ec_number, id_number, reference_number, start_date, end_date, amount
+No markdown, no backticks, no explanation. Just the JSON."""
                     }
                 ],
             }
@@ -97,23 +100,38 @@ Return only the JSON object."""
 
 @router.post("/")
 def create_order(data: OrderCreate, db: Session = Depends(get_db)):
+    from datetime import datetime
+
+    # Parse dates
+    try:
+        start = datetime.strptime(data.start_date, "%d/%m/%Y")
+        end = datetime.strptime(data.end_date, "%d/%m/%Y")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use DD/MM/YYYY")
+
+    # Calculate term in months for internal tracking
+    term_months = (end.year - start.year) * 12 + (end.month - start.month)
+    if term_months <= 0:
+        term_months = 1
+
+    # Find or create client
     existing_client = db.query(models.Client).filter(
         models.Client.ec_number == data.ec_number
     ).first()
 
     if existing_client:
         client_obj = existing_client
+        # Update ID number if changed
+        client_obj.id_number = data.id_number
     else:
         client_obj = models.Client(
-            full_name=data.full_name,
+            full_name="",
             id_number=data.id_number,
             ec_number=data.ec_number,
-            employer=data.employer,
+            employer=None,
         )
         db.add(client_obj)
         db.flush()
-
-    monthly_instalment = round(data.amount / data.term_months, 2)
 
     order = models.Order(
         client_id=client_obj.id,
@@ -121,10 +139,29 @@ def create_order(data: OrderCreate, db: Session = Depends(get_db)):
         reference_number=data.reference_number,
         amount=data.amount,
         currency=data.currency,
-        term_months=data.term_months,
-        monthly_instalment=monthly_instalment,
+        term_months=term_months,
+        monthly_instalment=data.amount,
     )
     db.add(order)
+    db.flush()
+
+    # Find open batch or create one
+    open_batch = db.query(models.Batch).filter(
+        models.Batch.status == models.BatchStatusEnum.OPEN
+    ).first()
+
+    if not open_batch:
+        count = db.query(models.Batch).count()
+        batch_number = f"BATCH-{datetime.now().year}-{str(count + 1).zfill(3)}"
+        open_batch = models.Batch(batch_number=batch_number)
+        db.add(open_batch)
+        db.flush()
+
+    batch_order = models.BatchOrder(
+        batch_id=open_batch.id,
+        order_id=order.id,
+    )
+    db.add(batch_order)
     db.commit()
     db.refresh(order)
 
@@ -132,5 +169,7 @@ def create_order(data: OrderCreate, db: Session = Depends(get_db)):
         "message": "Order saved successfully",
         "order_id": order.id,
         "client_id": client_obj.id,
-        "monthly_instalment": monthly_instalment,
+        "monthly_instalment": data.amount,
+        "term_months": term_months,
+        "batch_number": open_batch.batch_number,
     }

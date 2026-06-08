@@ -171,7 +171,7 @@ def export_batch(batch_id: int, db: Session = Depends(get_db)):
             start_date.strftime("%d/%b/%Y"),
             end_date.strftime("%d/%b/%Y"),
             order.monthly_instalment,
-        ])
+    ])
 
     # Save to buffer
     buffer = io.BytesIO()
