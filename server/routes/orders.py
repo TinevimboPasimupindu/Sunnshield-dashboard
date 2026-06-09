@@ -145,14 +145,20 @@ def create_order(data: OrderCreate, db: Session = Depends(get_db)):
     db.add(order)
     db.flush()
 
-    # Find open batch or create one
+    # Find open batch for this currency or create one
+    date_str = datetime.now().strftime("%Y%m%d")
+    currency_prefix = data.currency
+
     open_batch = db.query(models.Batch).filter(
-        models.Batch.status == models.BatchStatusEnum.OPEN
+        models.Batch.status == models.BatchStatusEnum.OPEN,
+        models.Batch.batch_number.like(f"{currency_prefix}-%")
     ).first()
 
     if not open_batch:
-        count = db.query(models.Batch).count()
-        batch_number = f"BATCH-{datetime.now().year}-{str(count + 1).zfill(3)}"
+        count = db.query(models.Batch).filter(
+            models.Batch.batch_number.like(f"{currency_prefix}-%")
+        ).count()
+        batch_number = f"{currency_prefix}-{date_str}-{str(count + 1).zfill(3)}"
         open_batch = models.Batch(batch_number=batch_number)
         db.add(open_batch)
         db.flush()

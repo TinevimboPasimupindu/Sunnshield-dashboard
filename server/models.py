@@ -11,9 +11,8 @@ class CurrencyEnum(str, enum.Enum):
 class BatchStatusEnum(str, enum.Enum):
     OPEN = "OPEN"
     SUBMITTED = "SUBMITTED"
+    IN_PROGRESS = "IN_PROGRESS"
     APPROVED = "APPROVED"
-    PARTIAL = "PARTIAL"
-    REJECTED = "REJECTED"
 
 class BatchOrderStatusEnum(str, enum.Enum):
     PENDING = "PENDING"

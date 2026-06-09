@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from database import get_db
@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font
 import io
-
+import openpyxl
 
 router = APIRouter(prefix="/api/batches", tags=["batches"])
 
@@ -75,6 +75,77 @@ def get_open_batch(db: Session = Depends(get_db)):
             "status": batch.status,
             "total_orders": len(batch.batch_orders),
         }
+    }
+
+@router.post("/import-global")
+async def import_global(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    contents = await file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(contents))
+    ws = wb.active
+
+    headers = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
+
+    try:
+        ec_col = headers.index("Ec number")
+        status_col = headers.index("Status")
+        message_col = headers.index("Message") if "Message" in headers else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid file format — missing required columns")
+
+    approved_count = 0
+    rejected_count = 0
+    not_found = []
+    updated_batches = set()
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        ec_number = str(row[ec_col]).strip() if row[ec_col] else None
+        status = str(row[status_col]).strip() if row[status_col] else None
+        message = str(row[message_col]).strip() if message_col is not None and row[message_col] else None
+
+        if not ec_number:
+            continue
+
+        batch_order = db.query(models.BatchOrder).join(models.Order).join(models.Client).filter(
+            models.Client.ec_number == ec_number,
+            models.BatchOrder.status == models.BatchOrderStatusEnum.PENDING
+        ).first()
+
+        if not batch_order:
+            not_found.append(ec_number)
+            continue
+
+        if status == "SUCCESS":
+            batch_order.status = models.BatchOrderStatusEnum.APPROVED
+            approved_count += 1
+        elif status == "FAILED":
+            batch_order.status = models.BatchOrderStatusEnum.REJECTED
+            batch_order.rejection_reason = message
+            rejected_count += 1
+
+        updated_batches.add(batch_order.batch_id)
+
+    for batch_id in updated_batches:
+        batch = db.query(models.Batch).filter(models.Batch.id == batch_id).first()
+        if not batch:
+            continue
+        all_statuses = [bo.status for bo in batch.batch_orders]
+        pending = sum(1 for s in all_statuses if s == models.BatchOrderStatusEnum.PENDING)
+        approved = sum(1 for s in all_statuses if s == models.BatchOrderStatusEnum.APPROVED)
+        rejected = sum(1 for s in all_statuses if s == models.BatchOrderStatusEnum.REJECTED)
+
+        if pending > 0 or rejected > 0:
+            batch.status = models.BatchStatusEnum.IN_PROGRESS
+        elif approved > 0 and rejected == 0 and pending == 0:
+            batch.status = models.BatchStatusEnum.APPROVED
+
+    db.commit()
+
+    return {
+        "message": "Global import processed",
+        "approved": approved_count,
+        "rejected": rejected_count,
+        "batches_updated": len(updated_batches),
+        "not_found": not_found,
     }
 
 @router.post("/{batch_id}/add-order/{order_id}")
@@ -144,36 +215,30 @@ def export_batch(batch_id: int, db: Session = Depends(get_db)):
     ws = wb.active
     ws.title = "Sheet1"
 
-    # Header row styling
     headers = ["Reference", "IdNumber", "EcNumber", "Type", "StartDate", "EndDate", "Amount"]
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
 
-    # Column widths
     col_widths = [15, 20, 15, 10, 15, 15, 12]
     for i, width in enumerate(col_widths, 1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
 
-    # Data rows
     for bo in batch.batch_orders:
         order = bo.order
         client = order.client
-
-        start_date = order.created_at or datetime.utcnow()
-        end_date = start_date + timedelta(days=30 * order.term_months)
-
+        start_date = order.start_date or (order.created_at.strftime("%d/%b/%Y") if order.created_at else datetime.utcnow().strftime("%d/%b/%Y"))
+        end_date = order.end_date or ""
         ws.append([
             order.reference_number or "",
             client.id_number,
             client.ec_number,
             "NEW",
-            start_date.strftime("%d/%b/%Y"),
-            end_date.strftime("%d/%b/%Y"),
+            start_date,
+            end_date,
             order.monthly_instalment,
-    ])
+        ])
 
-    # Save to buffer
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -184,3 +249,92 @@ def export_batch(batch_id: int, db: Session = Depends(get_db)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+@router.post("/{batch_id}/import-response")
+async def import_response(batch_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    batch = db.query(models.Batch).filter(models.Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    contents = await file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(contents))
+    ws = wb.active
+
+    headers = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
+
+    try:
+        ec_col = headers.index("Ec number")
+        status_col = headers.index("Status")
+        message_col = headers.index("Message") if "Message" in headers else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid file format")
+
+    approved_count = 0
+    rejected_count = 0
+    not_found = []
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        ec_number = str(row[ec_col]).strip() if row[ec_col] else None
+        status = str(row[status_col]).strip() if row[status_col] else None
+        message = str(row[message_col]).strip() if message_col is not None and row[message_col] else None
+
+        if not ec_number:
+            continue
+
+        batch_order = db.query(models.BatchOrder).join(models.Order).join(models.Client).filter(
+            models.BatchOrder.batch_id == batch_id,
+            models.Client.ec_number == ec_number
+        ).first()
+
+        if not batch_order:
+            not_found.append(ec_number)
+            continue
+
+        if status == "SUCCESS":
+            batch_order.status = models.BatchOrderStatusEnum.APPROVED
+            approved_count += 1
+        elif status == "FAILED":
+            batch_order.status = models.BatchOrderStatusEnum.REJECTED
+            batch_order.rejection_reason = message
+            rejected_count += 1
+
+    all_statuses = [bo.status for bo in batch.batch_orders]
+    pending = sum(1 for s in all_statuses if s == models.BatchOrderStatusEnum.PENDING)
+    approved = sum(1 for s in all_statuses if s == models.BatchOrderStatusEnum.APPROVED)
+    rejected = sum(1 for s in all_statuses if s == models.BatchOrderStatusEnum.REJECTED)
+
+    if pending > 0 or rejected > 0:
+        batch.status = models.BatchStatusEnum.IN_PROGRESS
+    elif approved > 0 and rejected == 0 and pending == 0:
+        batch.status = models.BatchStatusEnum.APPROVED
+
+    db.commit()
+
+    return {
+        "message": "Response file processed",
+        "approved": approved_count,
+        "rejected": rejected_count,
+        "not_found": not_found,
+    }
+
+@router.delete("/{batch_id}")
+def delete_batch(batch_id: int, db: Session = Depends(get_db)):
+    batch = db.query(models.Batch).filter(models.Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    # Block deletion if batch has approved orders
+    approved = sum(1 for bo in batch.batch_orders 
+                   if bo.status == models.BatchOrderStatusEnum.APPROVED)
+    if approved > 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot delete a batch with approved orders"
+        )
+    
+    db.query(models.BatchOrder).filter(
+        models.BatchOrder.batch_id == batch_id
+    ).delete()
+    db.delete(batch)
+    db.commit()
+    return {"message": "Batch deleted"}
