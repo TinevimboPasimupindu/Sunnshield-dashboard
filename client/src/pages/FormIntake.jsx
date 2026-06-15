@@ -35,6 +35,7 @@ export default function FormIntake() {
 
   const scanForm = async (file) => {
     setScanning(true);
+    setAiExtracted(false);
     try {
       const formData = new FormData();
       formData.append("file", file);
@@ -42,15 +43,19 @@ export default function FormIntake() {
         headers: { "Content-Type": "multipart/form-data" },
       });
       const extracted = res.data.extracted;
-      setForm(prev => ({
-        ...prev,
+      console.log("Extracted:", extracted);
+
+      
+      
+      setForm({
         ec_number: extracted.ec_number || "",
         id_number: extracted.id_number || "",
         reference_number: extracted.reference_number || "",
         start_date: extracted.start_date || "",
         end_date: extracted.end_date || "",
-        amount: extracted.amount || "",
-      }));
+        amount: extracted.amount !== null ? String(extracted.amount) : "",
+        currency: extracted.currency || "USD",
+      });
       setAiExtracted(true);
     } catch (err) {
       setError("Scan failed — please fill in the fields manually.");
