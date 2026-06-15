@@ -4,6 +4,9 @@ from database import engine, Base
 from dotenv import load_dotenv
 from routes import auth, orders, batches, dashboard
 import models
+from routes import auth, orders, batches, dashboard, repunches
+
+
 
 load_dotenv()
 
@@ -23,6 +26,7 @@ app.include_router(auth.router)
 app.include_router(orders.router)
 app.include_router(batches.router)
 app.include_router(dashboard.router)
+app.include_router(repunches.router)
 
 @app.get("/")
 def root():

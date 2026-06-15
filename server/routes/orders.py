@@ -10,6 +10,8 @@ import os
 import json
 import pathlib
 from dotenv import load_dotenv
+from PIL import Image
+import io as io_module
 
 # Load .env from the server directory
 load_dotenv(dotenv_path=pathlib.Path(__file__).parent / ".env")
@@ -34,6 +36,19 @@ async def scan_form(file: UploadFile = File(...)):
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     contents = await file.read()
+    # Auto-rotate image based on EXIF data
+    try:
+        img = Image.open(io_module.BytesIO(contents))
+        exif = img.getexif()
+        orientation = exif.get(274)
+        rotations = {3: 180, 6: 270, 8: 90}
+        if orientation in rotations:
+            img = img.rotate(rotations[orientation], expand=True)
+        output = io_module.BytesIO()
+        img.save(output, format="JPEG")
+        contents = output.getvalue()
+    except Exception:
+        pass
     base64_image = base64.standard_b64encode(contents).decode("utf-8")
 
     extension = file.filename.split(".")[-1].lower()
@@ -80,6 +95,13 @@ No markdown, no backticks, no explanation. Just the JSON."""
     )
 
     raw = message.content[0].text.strip()
+
+    # Strip markdown code blocks if present
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
 
     try:
         extracted = json.loads(raw)
@@ -141,6 +163,8 @@ def create_order(data: OrderCreate, db: Session = Depends(get_db)):
         currency=data.currency,
         term_months=term_months,
         monthly_instalment=data.amount,
+        start_date=data.start_date,
+        end_date=data.end_date,
     )
     db.add(order)
     db.flush()

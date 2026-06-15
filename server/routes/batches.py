@@ -227,17 +227,16 @@ def export_batch(batch_id: int, db: Session = Depends(get_db)):
     for bo in batch.batch_orders:
         order = bo.order
         client = order.client
-        start_date = order.start_date or (order.created_at.strftime("%d/%b/%Y") if order.created_at else datetime.utcnow().strftime("%d/%b/%Y"))
-        end_date = order.end_date or ""
+
         ws.append([
             order.reference_number or "",
             client.id_number,
             client.ec_number,
             "NEW",
-            start_date,
-            end_date,
+            order.start_date or "",
+            order.end_date or "",
             order.monthly_instalment,
-        ])
+    ])
 
     buffer = io.BytesIO()
     wb.save(buffer)
