@@ -21,11 +21,47 @@ router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 
 def normalize_date(date_str):
-    """Ensure a date string is DD/MM/YYYY. Converts 8-digit no-slash dates (e.g. "30062026"); leaves other formats untouched."""
+    """Ensure a date string is DD/MM/YYYY.
+
+    Handles common AI misreads of grid-box dates: bare digit strings missing
+    slashes (6-8 digits), 2-digit years, and dot/dash separators. Returns
+    None when the input is too ambiguous to reconstruct reliably (fewer than
+    6 digits, or exactly 7); returns the original value unchanged when it
+    doesn't match any known malformed shape.
+    """
     if not date_str:
         return date_str
-    if re.fullmatch(r"\d{8}", date_str):
-        return f"{date_str[0:2]}/{date_str[2:4]}/{date_str[4:8]}"
+
+    # Pure digit strings (no separators) — length tells us what's missing
+    if re.fullmatch(r"\d+", date_str):
+        length = len(date_str)
+        if length < 6:
+            # Too few digits to reliably reconstruct DD/MM/YYYY
+            return None
+        if length == 6:
+            # DDMMYY -> DD/MM/20YY
+            return f"{date_str[0:2]}/{date_str[2:4]}/20{date_str[4:6]}"
+        if length == 7:
+            # One digit short — can't tell which field lost a digit
+            return None
+        if length == 8:
+            # DDMMYYYY -> DD/MM/YYYY
+            return f"{date_str[0:2]}/{date_str[2:4]}/{date_str[4:8]}"
+        return date_str
+
+    # Normalize dot/dash separators to slashes
+    normalized = re.sub(r"[.\-]", "/", date_str)
+
+    # DD/MM/YY -> DD/MM/20YY
+    match = re.fullmatch(r"(\d{2})/(\d{2})/(\d{2})", normalized)
+    if match:
+        day, month, year = match.groups()
+        return f"{day}/{month}/20{year}"
+
+    # Already DD/MM/YYYY once separators are normalized
+    if re.fullmatch(r"\d{2}/\d{2}/\d{4}", normalized):
+        return normalized
+
     return date_str
 
 
@@ -77,7 +113,7 @@ async def scan_form(file: UploadFile = File(...)):
         model="claude-opus-5",
         max_tokens=2048,
         thinking={"type": "adaptive"},
-        output_config={"effort": "low"},
+        output_config={"effort": "medium"},
         messages=[
             {
                 "role": "user",
@@ -109,8 +145,18 @@ RULES:
 - EC numbers and ID numbers are continuous strings with NO spaces, e.g. 2012368F not 2 0 1 2 3 6 8 F.
 - Zimbabwean ID format: digits, then a letter, then 2 digits, e.g. 12139005V12.
 - FROM DATE and TO DATE: only read values from fields with those exact labels. Never read dates from the legal notice text, even if no FROM DATE/TO DATE field is visible.
+- FROM DATE and TO DATE each have exactly 8 digit boxes arranged as DD MM YYYY — two boxes for day, two for month, four for year. Read all 8 digits carefully and return in DD/MM/YYYY format. Double-check you have exactly 8 digits before returning.
 - AMOUNT: The AMOUNT field has individual grid boxes. Look for the last boxes in the AMOUNT row that contain handwritten digits. The format is always written as two parts separated by a dash e.g. 8-75 where 8 is dollars and 75 is cents, giving 8.75. If you see digits like 11-00 that means 11.00. Ignore any boxes that are empty or have only a horizontal strikethrough line through them.
 - If a field's label is not visible in the image, or its value is illegible, return null for that field. Do not guess.
+
+VALIDATION — before returning your JSON, check each field against these rules and correct if wrong:
+- ec_number: typically 6-10 alphanumeric characters, may end in a letter. If you see repeated digits like 99 or 222, double-check you read all the boxes — do not drop repeated characters.
+- id_number: Zimbabwean format is digits + letter + 2 digits. Total length is typically 11 characters. Common pattern: 8 digits, then a letter like V or R or U, then 2 digits e.g. 12139005V12. If your extracted value is shorter than 10 characters, re-examine the image carefully.
+- reference_number: typically 6-10 alphanumeric characters mixing digits and uppercase letters.
+- start_date and end_date: must be DD/MM/YYYY with exactly 8 digits. If you have fewer than 8 digits, re-examine the date boxes carefully.
+- amount: a decimal number. The dash separates main amount from cents e.g. 8-75 = 8.75. Should not be a large number like 400 or 8777.
+
+If any field fails its rule, look at the image again for that field specifically and correct it before returning the JSON.
 
 Return ONLY valid JSON with exactly these keys: ec_number, id_number, reference_number, start_date, end_date, amount
 No markdown, no backticks, no explanation. Just the JSON."""
