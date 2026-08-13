@@ -5,7 +5,6 @@ from typing import Optional
 from database import get_db
 import models
 import anthropic
-import base64
 import os
 import json
 import re
@@ -13,9 +12,16 @@ import pathlib
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 import io as io_module
+from google.cloud import documentai_v1 as documentai
+from google.oauth2 import service_account
+from google.api_core.client_options import ClientOptions
+import certifi
+
+# Fix gRPC SSL certificate verification on Windows
+os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
 
 # Load .env from the server directory
-load_dotenv(dotenv_path=pathlib.Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=pathlib.Path(__file__).parent.parent / ".env")
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
@@ -82,7 +88,8 @@ async def scan_form(file: UploadFile = File(...)):
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     contents = await file.read()
-    # Auto-rotate, boost contrast, and normalize to RGB before sending to Claude
+    # Auto-rotate, boost contrast, and normalize to RGB before sending to Document AI
+    converted_to_jpeg = False
     try:
         img = Image.open(io_module.BytesIO(contents))
         exif = img.getexif()
@@ -96,70 +103,97 @@ async def scan_form(file: UploadFile = File(...)):
         output = io_module.BytesIO()
         img.save(output, format="JPEG")
         contents = output.getvalue()
+        converted_to_jpeg = True
     except Exception:
         pass
-    base64_image = base64.standard_b64encode(contents).decode("utf-8")
 
-    extension = file.filename.split(".")[-1].lower()
-    media_type_map = {
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "webp": "image/webp",
+    if converted_to_jpeg:
+        # PIL re-saved the image as JPEG, so the bytes are always JPEG now
+        media_type = "image/jpeg"
+    else:
+        extension = file.filename.split(".")[-1].lower()
+        media_type_map = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+        }
+        media_type = media_type_map.get(extension, "image/jpeg")
+
+    # ---------- STAGE 1: Google Document AI extraction ----------
+    credentials_path = pathlib.Path(__file__).parent.parent / os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    credentials = service_account.Credentials.from_service_account_file(str(credentials_path))
+    docai_client = documentai.DocumentProcessorServiceClient(
+        credentials=credentials,
+        client_options=ClientOptions(api_endpoint="eu-documentai.googleapis.com")
+    )
+
+    processor_name = docai_client.processor_path(
+        os.getenv("GOOGLE_PROJECT_ID"),
+        os.getenv("GOOGLE_LOCATION"),
+        os.getenv("GOOGLE_PROCESSOR_ID"),
+    )
+
+    docai_response = docai_client.process_document(
+        request=documentai.ProcessRequest(
+            name=processor_name,
+            raw_document=documentai.RawDocument(content=contents, mime_type=media_type),
+        )
+    )
+    document = docai_response.document
+
+    # Custom Extractor processors return results as entities, not form_fields
+    docai_fields = {}
+    for entity in document.entities:
+        name = entity.type_.strip().lower()
+        value = entity.mention_text.strip() if entity.mention_text else None
+        docai_fields[name] = value
+
+    raw_data = {
+        "row_ec_id": docai_fields.get("row_ec_id"),
+        "row_dates": docai_fields.get("row_dates"),
+        "reference_number": docai_fields.get("reference_number"),
+        "amount": docai_fields.get("amount"),
+        "sale_date": docai_fields.get("sale_date"),
     }
-    media_type = media_type_map.get(extension, "image/jpeg")
+
+    # ---------- STAGE 2: Claude cleanup ----------
+    cleanup_prompt = f"""You are cleaning and formatting raw OCR data extracted from a Zimbabwean civil servant SSB salary deduction form. Fix formatting issues and return structured JSON.
+
+Raw extracted data:
+{json.dumps(raw_data)}
+
+RULES FOR EACH FIELD:
+
+row_ec_id contains the EC NUMBER, CD letter, and ID NUMBER on one line. Split into:
+- ec_number: first 7 digits + the CD letter combined e.g. '0132003 F' becomes '0132003F'. Always 8 characters total: 7 digits + 1 uppercase letter. If last character looks like 0 it might be O, if it looks like 5 it might be S.
+- id_number: the remaining characters after EC and CD. Zimbabwean format: digits + 1 uppercase letter + 2 digits e.g. 12139005V12. The letter is always the 3rd character from the end. If that position contains a digit like 2 it is likely Z, if 0 it is likely Q, if 5 it is likely S. The last 2 characters must always be digits.
+
+row_dates contains two dates. Split into:
+- start_date: the earlier/smaller date. Set day to 01. Format as 01/MM/YYYY.
+- end_date: the later/larger date. Set day to last day of that month. Format as DD/MM/YYYY.
+
+reference_number: digits followed by either NH1 or B182. If you see an N or H in the suffix it is NH1. If you see a B or 18 in the suffix it is B182. Fix any misread characters to match one of these two endings exactly.
+
+amount: a positive decimal number. Remove any negative signs. The format on the form uses a dash to separate main amount from cents e.g. 787-00 means 787.00. Remove strikethrough dashes. Return as a positive decimal number.
+
+sale_date: the date the form was signed at the bottom. Normalize to DD/MM/YYYY format.
+
+Return ONLY valid JSON with these exact keys: ec_number, id_number, reference_number, start_date, end_date, amount, sale_date
+No markdown, no backticks, no explanation. Just the JSON."""
 
     message = client.messages.create(
         model="claude-opus-5",
         max_tokens=2048,
         thinking={"type": "adaptive"},
-        output_config={"effort": "medium"},
+        output_config={"effort": "low"},
         messages=[
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": base64_image,
-                        },
-                    },
-                    {
                         "type": "text",
-                        "text": """The attached image may be rotated 90, 180, or 270 degrees, and may contain multiple documents, background clutter, a pink proforma invoice, or only a partial view of the form you need. Read the content regardless of orientation. Do not assume the image is a clean, isolated photo of a single form.
-
-Your task: scan the ENTIRE image looking specifically for a white SSB salary deduction form, and within it, these labeled fields:
-
-- "EC NUMBER" or "EC No" — followed by grid boxes containing the employee code
-- "I.D NUMBER" or "ID NUMBER" — followed by grid boxes containing the ID number
-- "FROM DATE" — followed by grid boxes containing the start date
-- "TO DATE" — followed by grid boxes containing the end date
-- "REFERENCE NUMBER" — followed by grid boxes containing the reference
-- "AMOUNT" — followed by a row of boxes where the actual amount is written at the right end, after empty/crossed-out boxes
-
-RULES:
-- Find each field by its LABEL, not by its position in the image. Do not assume a field is "in the middle" or "near the top" — locate the label text first, then read the boxes next to it.
-- Ignore everything that is not next to one of the six labels above. This includes: the pink proforma invoice (if visible), the legal notice text at the bottom of the form, PAYEE CODE, STATION CODE, DEP CODE, and any other CODE fields.
-- EC numbers and ID numbers are continuous strings with NO spaces, e.g. 2012368F not 2 0 1 2 3 6 8 F.
-- Zimbabwean ID format: digits, then a letter, then 2 digits, e.g. 12139005V12.
-- FROM DATE and TO DATE: only read values from fields with those exact labels. Never read dates from the legal notice text, even if no FROM DATE/TO DATE field is visible.
-- FROM DATE and TO DATE each have exactly 8 digit boxes arranged as DD MM YYYY — two boxes for day, two for month, four for year. Read all 8 digits carefully and return in DD/MM/YYYY format. Double-check you have exactly 8 digits before returning.
-- AMOUNT: The AMOUNT field has individual grid boxes. Look for the last boxes in the AMOUNT row that contain handwritten digits. The format is always written as two parts separated by a dash e.g. 8-75 where 8 is dollars and 75 is cents, giving 8.75. If you see digits like 11-00 that means 11.00. Ignore any boxes that are empty or have only a horizontal strikethrough line through them.
-- If a field's label is not visible in the image, or its value is illegible, return null for that field. Do not guess.
-
-VALIDATION — before returning your JSON, check each field against these rules and correct if wrong:
-- ec_number: typically 6-10 alphanumeric characters, may end in a letter. If you see repeated digits like 99 or 222, double-check you read all the boxes — do not drop repeated characters.
-- id_number: Zimbabwean format is digits + letter + 2 digits. Total length is typically 11 characters. Common pattern: 8 digits, then a letter like V or R or U, then 2 digits e.g. 12139005V12. If your extracted value is shorter than 10 characters, re-examine the image carefully.
-- reference_number: typically 6-10 alphanumeric characters mixing digits and uppercase letters.
-- start_date and end_date: must be DD/MM/YYYY with exactly 8 digits. If you have fewer than 8 digits, re-examine the date boxes carefully.
-- amount: a decimal number. The dash separates main amount from cents e.g. 8-75 = 8.75. Should not be a large number like 400 or 8777.
-
-If any field fails its rule, look at the image again for that field specifically and correct it before returning the JSON.
-
-Return ONLY valid JSON with exactly these keys: ec_number, id_number, reference_number, start_date, end_date, amount
-No markdown, no backticks, no explanation. Just the JSON."""
+                        "text": cleanup_prompt,
                     }
                 ],
             }
@@ -186,6 +220,7 @@ No markdown, no backticks, no explanation. Just the JSON."""
             "start_date": None,
             "end_date": None,
             "amount": None,
+            "sale_date": None,
         }
 
     return {"extracted": extracted}

@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+#Google form parser credentials
+server/google_credentials.json
+
 # Node
 client/node_modules/
 client/dist/
