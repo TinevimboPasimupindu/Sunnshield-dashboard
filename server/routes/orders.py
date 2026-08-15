@@ -16,6 +16,7 @@ from google.cloud import documentai_v1 as documentai
 from google.oauth2 import service_account
 from google.api_core.client_options import ClientOptions
 import certifi
+from services.zim_id_validator import parse, suggest_corrections
 
 # Fix gRPC SSL certificate verification on Windows
 os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"] = certifi.where()
@@ -167,7 +168,20 @@ RULES FOR EACH FIELD:
 
 row_ec_id contains the EC NUMBER, CD letter, and ID NUMBER on one line. Split into:
 - ec_number: first 7 digits + the CD letter combined e.g. '0132003 F' becomes '0132003F'. Always 8 characters total: 7 digits + 1 uppercase letter. If last character looks like 0 it might be O, if it looks like 5 it might be S.
-- id_number: the remaining characters after EC and CD. Zimbabwean format: digits + 1 uppercase letter + 2 digits e.g. 12139005V12. The letter is always the 3rd character from the end. If that position contains a digit like 2 it is likely Z, if 0 it is likely Q, if 5 it is likely S. The last 2 characters must always be digits.
+- id_number: the remaining characters after EC and CD. Zimbabwean format: digits + 1 uppercase letter + 2 digits e.g. 12139005V12. The letter is always the 3rd character from the end. The last 2 characters must always be digits.
+
+The character at the letter position (3rd from end) must always be an uppercase letter, never a digit. If you find a digit in that position, convert it to the most likely letter it resembles:
+- 0 → Q
+- 1 → I
+- 2 → Z
+- 4 → A
+- 5 → S
+- 6 → G
+- 7 → T
+- 8 → B
+- 9 → G
+
+Never apply these conversions to any other position in the ID number — only the 3rd character from the end. All other positions must remain as digits.
 
 row_dates contains two dates. Split into:
 - start_date: the earlier/smaller date. Set day to 01. Format as 01/MM/YYYY.
@@ -212,6 +226,20 @@ No markdown, no backticks, no explanation. Just the JSON."""
         extracted = json.loads(raw)
         extracted["start_date"] = normalize_date(extracted.get("start_date"))
         extracted["end_date"] = normalize_date(extracted.get("end_date"))
+
+        # Validate/correct the ID number against the Zimbabwe ID checksum
+        id_number = extracted.get("id_number")
+        if id_number:
+            parsed = parse(id_number)
+            if not parsed.is_fully_valid:
+                id_result = suggest_corrections(id_number)
+                if len(id_result.corrections) == 1:
+                    # Unambiguous fix — safe to apply automatically
+                    corrected_id, _notes, _cost = id_result.corrections[0]
+                    extracted["id_number"] = corrected_id.replace("-", "")
+                # else: 0 corrections (uncorrectable) or multiple equally-plausible
+                # corrections (ambiguous) — leave id_number as is for manual review
+            # else: already valid, leave as is
     except json.JSONDecodeError:
         extracted = {
             "ec_number": None,
